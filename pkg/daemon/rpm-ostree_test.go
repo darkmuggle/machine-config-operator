@@ -18,6 +18,9 @@ type GetBootedOSImageURLReturn struct {
 // hold return values that will be returned when their corresponding methods are called.
 type RpmOstreeClientMock struct {
 	GetBootedOSImageURLReturns []GetBootedOSImageURLReturn
+	ExpectKernelArgs           []string
+	ExpectNewKernelArgs        []string
+	runRpmOstreeFunc           rpmOstreeCommander
 }
 
 // GetBootedOSImageURL implements a test version of RpmOStreeClients GetBootedOSImageURL.
@@ -41,4 +44,20 @@ func (r RpmOstreeClientMock) GetStatus() (string, error) {
 
 func (r RpmOstreeClientMock) GetBootedDeployment() (*RpmOstreeDeployment, error) {
 	return &RpmOstreeDeployment{}, nil
+}
+
+func (r RpmOstreeClientMock) GetKernelArgs() ([]string, error) {
+	return r.ExpectKernelArgs, nil
+}
+
+func (r RpmOstreeClientMock) SetKernelArgs(args []KernelArgument) (string, error) {
+	return "", nil
+}
+
+func (r RpmOstreeClientMock) RemovePendingDeployment() error {
+	return nil
+}
+
+func (r RpmOstreeClientMock) RunRpmOstree(a string, b ...string) ([]byte, error) {
+	return r.runRpmOstreeFunc(a, b...)
 }
