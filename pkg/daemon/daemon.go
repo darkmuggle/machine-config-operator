@@ -1406,6 +1406,9 @@ func checkV3Units(units []ign3types.Unit) error {
 	for _, u := range units {
 		for j := range u.Dropins {
 			path := filepath.Join(pathSystemd, u.Name+".d", u.Dropins[j].Name)
+			if u.Dropins[j].Contents == nil || *u.Dropins[j].Contents == "" {
+				continue
+			}
 			if err := checkFileContentsAndMode(path, []byte(*u.Dropins[j].Contents), defaultFilePermissions); err != nil {
 				return err
 			}

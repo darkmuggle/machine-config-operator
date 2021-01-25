@@ -1391,6 +1391,17 @@ func (dn *Daemon) deleteStaleData(oldIgnConfig, newIgnConfig *ign3types.Config) 
 				}
 				glog.Infof("Removed stale systemd dropin %q", path)
 			}
+
+			if u.Dropins[j].Contents == nil || *u.Dropins[j].Contents == "" {
+				glog.V(2).Infof("Updated systemd dropin %q has zero length, removing as stale", path)
+				if err := os.Remove(noOrigFileStampName(path)); err != nil {
+					if !os.IsNotExist(err) {
+						glog.Warningf("%v", err)
+						continue
+					}
+					return errors.Wrapf(err, "deleting noorig file stamp %q: %v", noOrigFileStampName(path), err)
+				}
+			}
 		}
 		path := filepath.Join(pathSystemd, u.Name)
 		if _, ok := newUnitSet[path]; !ok {
@@ -1424,6 +1435,17 @@ func (dn *Daemon) deleteStaleData(oldIgnConfig, newIgnConfig *ign3types.Config) 
 			}
 			glog.Infof("Removed stale systemd unit %q", path)
 		}
+		if u.Contents == nil || *u.Contents == "" {
+			glog.V(2).Infof("Updated systemd unit %q has zero length, removing as stale", path)
+			if err := os.Remove(noOrigFileStampName(path)); err != nil {
+				if !os.IsNotExist(err) {
+					glog.Warningf("%v", err)
+					continue
+				}
+				return errors.Wrapf(err, "deleting noorig file stamp %q: %v", noOrigFileStampName(path), err)
+			}
+		}
+
 	}
 
 	return nil
