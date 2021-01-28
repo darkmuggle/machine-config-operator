@@ -377,13 +377,6 @@ func ExtractOSImage(imgURL string) (osImageContentDir string, err error) {
 	return
 }
 
-// Remove pending deployment on OSTree based system
-func removePendingDeployment() error {
-	args := []string{"cleanup", "-p"}
-	_, err := runGetOut("rpm-ostree", args...)
-	return err
-}
-
 func (dn *Daemon) applyOSChanges(oldConfig, newConfig *mcfgv1.MachineConfig) (retErr error) {
 	// Extract image and add coreos-extensions repo if we have either OS update or package layering to perform
 	mcDiff, err := newMachineConfigDiff(oldConfig, newConfig)
@@ -443,7 +436,7 @@ func (dn *Daemon) applyOSChanges(oldConfig, newConfig *mcfgv1.MachineConfig) (re
 		if retErr != nil {
 			// Print out the error now so that if we fail to cleanup -p, we don't lose it.
 			glog.Infof("Rolling back applied changes to OS due to error: %v", retErr)
-			if err := removePendingDeployment(); err != nil {
+			if err := dn.NodeUpdaterClient.RemovePendingDeployment(); err != nil {
 				retErr = errors.Wrapf(retErr, "error removing staged deployment: %v", err)
 				return
 			}
@@ -687,7 +680,7 @@ func (dn *Daemon) update(oldConfig, newConfig *mcfgv1.MachineConfig) (retErr err
 
 	// Ideally we would want to update kernelArguments only via MachineConfigs.
 	// We are keeping this to maintain compatibility and OKD requirement.
-	tuningChanged, err := UpdateTuningArgs(KernelTuningFile, CmdLineFile)
+	tuningChanged, err := UpdateTuningArgs(KernelTuningFile, dn.NodeUpdaterClient)
 	if err != nil {
 		return err
 	}
@@ -997,37 +990,23 @@ func parseKernelArguments(kargs []string) []string {
 // Note what we really should be doing though is also looking at the *current*
 // kernel arguments in case there was drift.  But doing that requires us knowing
 // what the "base" arguments are. See https://github.com/ostreedev/ostree/issues/479
-func generateKargs(oldConfig, newConfig *mcfgv1.MachineConfig) []string {
+func generateKargs(oldConfig, newConfig *mcfgv1.MachineConfig) []KernelArgument {
 	oldKargs := parseKernelArguments(oldConfig.Spec.KernelArguments)
 	newKargs := parseKernelArguments(newConfig.Spec.KernelArguments)
-	cmdArgs := []string{}
-
-	// To keep kernel argument processing simpler and bug free, we first delete all
-	// kernel arguments which have been applied by MCO previously and append all of the
-	// kernel arguments present in the new rendered MachineConfig.
-	// See https://bugzilla.redhat.com/show_bug.cgi?id=1866546#c10.
-	for _, arg := range oldKargs {
-		cmdArgs = append(cmdArgs, "--delete="+arg)
+	var kargs []KernelArgument
+	for _, oldArg := range oldKargs {
+		kargs = append(kargs, KernelArgument{Name: oldArg, Operation: kargRemove})
 	}
-	for _, arg := range newKargs {
-		cmdArgs = append(cmdArgs, "--append="+arg)
+	for _, newArg := range newKargs {
+		kargs = append(kargs, KernelArgument{Name: newArg, Operation: kargAdd})
 	}
-	return cmdArgs
+	return kargs
 }
 
-// updateKernelArguments adjusts the kernel args
+// updateKernelArguments passes the results of generateKargs to the NodeUpdaterClient.
 func (dn *Daemon) updateKernelArguments(oldConfig, newConfig *mcfgv1.MachineConfig) error {
 	kargs := generateKargs(oldConfig, newConfig)
-	if len(kargs) == 0 {
-		return nil
-	}
-	if !dn.os.IsCoreOSVariant() {
-		return fmt.Errorf("updating kargs on non-CoreOS nodes is not supported: %v", kargs)
-	}
-
-	args := append([]string{"kargs"}, kargs...)
-	dn.logSystem("Running rpm-ostree %v", args)
-	_, err := runGetOut("rpm-ostree", args...)
+	_, err := dn.NodeUpdaterClient.SetKernelArgs(kargs)
 	return err
 }
 
@@ -1137,7 +1116,7 @@ func (dn *Daemon) applyExtensions(oldConfig, newConfig *mcfgv1.MachineConfig) er
 
 	args := dn.generateExtensionsArgs(oldConfig, newConfig)
 	glog.Infof("Applying extensions : %+q", args)
-	_, err := runGetOut("rpm-ostree", args...)
+	_, err := dn.NodeUpdaterClient.RunRpmOstree(args[0], args[1:]...)
 
 	return err
 }
@@ -1167,7 +1146,7 @@ func (dn *Daemon) switchKernel(oldConfig, newConfig *mcfgv1.MachineConfig) error
 			args = append(args, "--uninstall", pkg)
 		}
 		dn.logSystem("Switching to kernelType=%s, invoking rpm-ostree %+q", newConfig.Spec.KernelType, args)
-		_, err := runGetOut("rpm-ostree", args...)
+		_, err := dn.NodeUpdaterClient.RunRpmOstree(args[0], args[1:]...)
 		return err
 	}
 
@@ -1180,7 +1159,7 @@ func (dn *Daemon) switchKernel(oldConfig, newConfig *mcfgv1.MachineConfig) error
 		}
 
 		dn.logSystem("Switching to kernelType=%s, invoking rpm-ostree %+q", newConfig.Spec.KernelType, args)
-		_, err := runGetOut("rpm-ostree", args...)
+		_, err := dn.NodeUpdaterClient.RunRpmOstree(args[0], args[1:]...)
 		return err
 	}
 
@@ -1188,7 +1167,7 @@ func (dn *Daemon) switchKernel(oldConfig, newConfig *mcfgv1.MachineConfig) error
 		if oldConfig.Spec.OSImageURL != newConfig.Spec.OSImageURL {
 			args := []string{"update"}
 			dn.logSystem("Updating rt-kernel packages on host: %+q", args)
-			_, err := runGetOut("rpm-ostree", args...)
+			_, err := dn.NodeUpdaterClient.RunRpmOstree(args[0], args[1:]...)
 			return err
 		}
 	}
@@ -1756,11 +1735,6 @@ func (dn *Daemon) updateSSHKeys(newUsers []ign3types.PasswdUser) error {
 
 // updateOS updates the system OS to the one specified in newConfig
 func (dn *Daemon) updateOS(config *mcfgv1.MachineConfig, osImageContentDir string) error {
-	if !dn.os.IsCoreOSVariant() {
-		glog.V(2).Info("Updating of non-CoreOS nodes are not supported")
-		return nil
-	}
-
 	newURL := config.Spec.OSImageURL
 	if compareOSImageURL(dn.bootedOSImageURL, newURL) {
 		return nil

@@ -20,6 +20,9 @@ const (
 	numRetriesNetCommands = 5
 	// Pull secret.  Written by the machine-config-operator
 	kubeletAuthFile = "/var/lib/kubelet/config.json"
+
+	// realRpmOstreeCmd is the binary name for rpmOstree
+	realRpmOstreeCmd = "/usr/bin/rpm-ostree"
 )
 
 // rpmOstreeState houses zero or more RpmOstreeDeployments
@@ -60,27 +63,52 @@ type imageInspection struct {
 // NodeUpdaterClient is an interface describing how to interact with the host
 // around content deployment
 type NodeUpdaterClient interface {
-	GetStatus() (string, error)
-	GetBootedOSImageURL() (string, string, error)
-	Rebase(string, string) (bool, error)
 	GetBootedDeployment() (*RpmOstreeDeployment, error)
+	GetBootedOSImageURL() (string, string, error)
+	GetKernelArgs() ([]string, error)
+	GetStatus() (string, error)
+	Rebase(string, string) (bool, error)
+	RemovePendingDeployment() error
+	SetKernelArgs([]KernelArgument) (string, error)
+	RunRpmOstree(string, ...string) ([]byte, error)
 }
 
 // RpmOstreeClient provides all RpmOstree related methods in one structure.
 // This structure implements DeploymentClient
 //
 // TODO(runcom): make this private to pkg/daemon!!!
-type RpmOstreeClient struct{}
+type RpmOstreeClient struct {
+	runRpmOstreeFunc rpmOstreeCommander
+}
 
 // NewNodeUpdaterClient returns a new instance of the default DeploymentClient (RpmOstreeClient)
 func NewNodeUpdaterClient() NodeUpdaterClient {
-	return &RpmOstreeClient{}
+	os, err := GetHostRunningOS()
+	if err != nil {
+		panic(fmt.Sprintf("Failed to query operating system: %v", err))
+	}
+	if !os.IsCoreOSVariant() {
+		glog.Infof("Host operating system %q is not a CoreOS variant", os.ID)
+		return &notCoreOSClient{}
+	}
+
+	return &RpmOstreeClient{
+		runRpmOstreeFunc: runRpmOstree,
+	}
+}
+
+// rpmOstreeCommander is a function for wrapping and mocking 'rpm-ostree'
+type rpmOstreeCommander func(string, ...string) ([]byte, error)
+
+// RunRpmOstree is an rpmOstreeCommander and executes r.rpmOstreeFunc
+func (r *RpmOstreeClient) RunRpmOstree(noun string, args ...string) ([]byte, error) {
+	return r.runRpmOstreeFunc(noun, args...)
 }
 
 // GetBootedDeployment returns the current deployment found
 func (r *RpmOstreeClient) GetBootedDeployment() (*RpmOstreeDeployment, error) {
 	var rosState rpmOstreeState
-	output, err := runGetOut("rpm-ostree", "status", "--json")
+	output, err := r.RunRpmOstree("status", "--json")
 	if err != nil {
 		return nil, err
 	}
@@ -101,7 +129,7 @@ func (r *RpmOstreeClient) GetBootedDeployment() (*RpmOstreeDeployment, error) {
 
 // GetStatus returns multi-line human-readable text describing system status
 func (r *RpmOstreeClient) GetStatus() (string, error) {
-	output, err := runGetOut("rpm-ostree", "status")
+	output, err := r.RunRpmOstree("status")
 	if err != nil {
 		return "", err
 	}
@@ -127,6 +155,28 @@ func (r *RpmOstreeClient) GetBootedOSImageURL() (string, string, error) {
 	}
 
 	return osImageURL, bootedDeployment.Version, nil
+}
+
+// qouteSpaceSplit splits on spaces unless the space is quoted
+// For example, 'boo=bar="YIPPIE KA YAY" baz foo' will split into
+// ['boo=bar="YIPPIE KA YAY"', "baz", "foo"]
+func quoteSpaceSplit(s string) []string {
+	quoted := false
+	return strings.FieldsFunc(s, func(r rune) bool {
+		if r == '"' {
+			quoted = !quoted
+		}
+		return !quoted && r == ' '
+	})
+}
+
+// GetKernelArgs returns the kernel arguments known to rpm-ostree
+func (r *RpmOstreeClient) GetKernelArgs() ([]string, error) {
+	out, err := r.RunRpmOstree("kargs")
+	if err != nil {
+		return nil, err
+	}
+	return quoteSpaceSplit(string(out)), nil
 }
 
 func podmanInspect(imgURL string) (imgdata *imageInspection, err error) {
@@ -171,6 +221,8 @@ func (r *RpmOstreeClient) Rebase(imgURL, osImageContentDir string) (changed bool
 	if err != nil {
 		return
 	}
+
+	glog.Infof("Updating OS to %s", imgURL)
 
 	previousPivot := ""
 	if len(defaultDeployment.CustomOrigin) > 0 {
@@ -245,15 +297,84 @@ func (r *RpmOstreeClient) Rebase(imgURL, osImageContentDir string) (changed bool
 	args := []string{"rebase", "--experimental", fmt.Sprintf("%s:%s", repo, ostreeCsum),
 		"--custom-origin-url", customURL, "--custom-origin-description", "Managed by machine-config-operator"}
 
-	var out []byte
-	if out, err = runGetOut("rpm-ostree", args...); err != nil {
-		// capture stdout output as well in case of error
-		err = errors.Wrapf(err, "with stdout output: %v", string(out))
-		return
-	}
-
+	_, err = runRpmOstree(args[0], args[1:]...)
 	changed = true
 	return
+}
+
+// constant for describing kernel argument operations
+const (
+	kargRemove int = iota
+	kargAdd
+)
+
+// KernelArgument describes an operation for karg handling
+type KernelArgument struct {
+	Operation int
+	Name      string
+}
+
+// runRpmOStree wraps the rpm-ostree command. Unless mocked, this
+// is the rpmOstreeCommander that is used by RpmOstreeClient.
+func runRpmOstree(noun string, args ...string) ([]byte, error) {
+	if len(args) > 2 {
+		return nil, fmt.Errorf("rpm-ostree command is malformed, not enough arguments")
+	}
+	glog.Infof("Executing cmd: '%s %s'", realRpmOstreeCmd, args)
+	out, err := runGetOut(realRpmOstreeCmd, args...)
+	if err != nil {
+		glog.Errorf("'%s %v' failed to run: %v:\n %s", realRpmOstreeCmd, args, string(out), err)
+	}
+	return out, err
+}
+
+// SetKernelArgs sets kernel arguments on an RPM OStree system.
+// If a composite karg is recieved as a sigle karg, its split ("cat=kitten pupppy=dog"
+// is split in ["cat=kitten", "puppy=dog"] and treated as two arguments.
+func (r *RpmOstreeClient) SetKernelArgs(args []KernelArgument) (string, error) {
+	var kargs []string
+	for _, v := range args {
+		for _, sv := range quoteSpaceSplit(v.Name) {
+			switch v.Operation {
+			case kargAdd:
+				kargs = append(kargs, fmt.Sprintf("--append=%s", sv))
+			case kargRemove:
+				inUse, err := r.isKernelArgInUse(sv)
+				if err != nil {
+					return "", err
+				}
+				if inUse {
+					kargs = append(kargs, fmt.Sprintf("--delete=%s", sv))
+				}
+			}
+		}
+	}
+	if len(kargs) == 0 {
+		return "", nil
+	}
+	out, err := r.RunRpmOstree("kargs", kargs...)
+	return string(out), err
+}
+
+// isKernelArgInUse checks to see if the argument is already in use by the system currently
+func (r RpmOstreeClient) isKernelArgInUse(arg string) (bool, error) {
+	checkable, err := r.GetKernelArgs()
+	if err != nil {
+		return false, err
+	}
+
+	for _, v := range checkable {
+		if strings.HasPrefix(v, arg) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// RemovePendingDeployment removes any pending rpm-ostree deployments
+func (r *RpmOstreeClient) RemovePendingDeployment() error {
+	_, err := r.RunRpmOstree("cleanup", "-p")
+	return err
 }
 
 // runGetOut executes a command, logging it, and return the stdout output.
