@@ -3,68 +3,64 @@ package daemon
 import (
 	"fmt"
 	"os"
-	"path/filepath"
+	"os/exec"
+	"os/signal"
+	"strings"
+	"syscall"
 
 	"github.com/golang/glog"
 )
 
-// genericCmdFunc describes a function for wrapping commands
-type genericCmdFunc func(args ...string) ([]byte, error)
-
-// systemctlFunc is a either a wrapper around the systemd binary or a mock
-// execSystemctlFunc should be used for the execution of systemctl commands
-var systemctlFunc genericCmdFunc
-
-// execSystemctlFunc executes systemctl or the mocking function.
-func execSystemctlFunc(args ...string) ([]byte, error) {
-	if systemctlFunc != nil {
-		glog.V(2).Info("Using a mocked function for systemctl")
-		return systemctlFunc(args...)
+// systemdInhibit executes systemd-inhibit by running an infinite sleep command.
+// The inhibit will exist until either the exitCh recieves an error or
+// the command is cancelled. The Kublet uses a similiar mechanism, although we
+// can't use it here since the Kublet uses a timer to set the inhbitor.
+func systemdInhibit() (func(), error) {
+	modes := []string{
+		"shutdown",
+		"sleep",
+		"idle",
+		"handle-power-key",
+		"handle-suspend-key",
+		"handle-hibernate-key",
+		"handle-lid-switch",
 	}
-	systemdBin := filepath.Join("usr", "bin", "systemctl")
-	return runGetOut(systemdBin, args...)
-}
 
-// reloadSystem restarts systemd
-func reloadSystemd() error {
-	out, err := execSystemctlFunc("daemon-reload")
-	if err != nil {
-		return fmt.Errorf("failed reload of systemd daemon: %s\n%v", string(out), err)
+	glog.Info("Inhibiting power states changes via systemd")
+
+	args := []string{
+		fmt.Sprintf("--what='%v'", strings.Join(modes, ":")),
+		fmt.Sprintf("--who='MCD Pid %d", os.Getpid()),
+		"--why='Update Operation'",
+		"/bin/sleep", "inifity",
 	}
-	return nil
-}
+	cmd := exec.Command("systemd-inhibit", args...)
 
-const (
-	// defaultRebootTargetLink is the backing file for the rebootTarget for systemd
-	defaultRebootTargetLink = "/dev/null"
-	// defaultRebootTarget is the systemd reboot.target filepath used when masking a reboot.
-	defaultRebootTarget = "/run/systemd/system/reboot.target"
-)
-
-var (
-	// rebootTargetLink is the backing file for the rebootTarget for systemd
-	rebootTargetLink = defaultRebootTargetLink
-	// rebootTarget is the systemd reboot.target filepath used when masking a reboot.
-	rebootTarget = defaultRebootTarget
-)
-
-// maskRebootTarget masks the systemd reboot.target to block reboots.
-func maskRebootTarget() error {
-	glog.Info("Setting a reboot.target systemd mask to prevent reboot during update operation")
-	if _, err := os.Lstat(rebootTarget); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("failed to check for existing reboot.target link: %w", err)
+	// done terminates the inhibitor
+	done := func() {
+		if !cmd.ProcessState.Exited() {
+			glog.Info("Releasing systemd inhibitor")
+			_ = cmd.Process.Kill()
+		}
+		glog.Info("Released systemd inhibitor")
 	}
-	if err := os.Symlink(rebootTargetLink, rebootTarget); err != nil {
-		return fmt.Errorf("failed to create %s masking symlink to %s: %v", rebootTargetLink, rebootTarget, err)
-	}
-	return reloadSystemd()
-}
 
-// unmaskRebootTarget removes the reboot mask.
-func unmaskRebootTarget() error {
-	glog.Info("Removing reboot mask")
-	if err := os.Remove(rebootTarget); err != nil && os.IsNotExist(err) {
-		return nil
-	}
-	return reloadSystemd()
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM, syscall.SIGUSR1, syscall.SIGUSR2)
+	err := cmd.Start()
+
+	// watch the inhibitor and make sure its cleaned up.
+	go func() {
+		for {
+			if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
+				break
+			}
+			select {
+			case <-sigs:
+				done()
+			}
+		}
+	}()
+
+	return done, err
 }

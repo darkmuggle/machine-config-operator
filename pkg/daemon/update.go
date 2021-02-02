@@ -584,20 +584,17 @@ func (dn *Daemon) update(oldConfig, newConfig *mcfgv1.MachineConfig) (retErr err
 			}
 		}
 	}
-	// Prevent any reboots
-	if err := maskRebootTarget(); err != nil {
-		return err
-	}
 
 	dn.catchIgnoreSIGTERM()
-	defer func() {
-		umErr := unmaskRebootTarget()
-		if retErr != nil {
-			retErr = fmt.Errorf("failed to unmask reboot.target: %v\n%w", umErr, retErr)
-		} else {
-			retErr = umErr
-		}
 
+	inhibitCancel, err := systemdInhibit()
+	if err != nil {
+		retErr = err
+		return
+	}
+	defer inhibitCancel()
+
+	defer func() {
 		if retErr != nil {
 			dn.cancelSIGTERM()
 		}
