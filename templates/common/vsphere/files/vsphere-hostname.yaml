@@ -7,4 +7,5 @@ contents:
 
     if vm_name=$(/bin/vmtoolsd --cmd 'info-get guestinfo.hostname'); then
         /usr/bin/hostnamectl --transient set-hostname ${vm_name}
+        echo "HOSTNAME_FLAG=\"--hostname-override=${vm_name}\"" > /etc/kubernetes/hostname-override
     fi

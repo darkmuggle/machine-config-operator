@@ -16,6 +16,7 @@ contents: |
   EnvironmentFile=/etc/os-release
   EnvironmentFile=-/etc/kubernetes/kubelet-workaround
   EnvironmentFile=-/etc/kubernetes/kubelet-env
+  EnvironmentFile=-/etc/kubernetes/hostname-override
 
   ExecStart=/usr/bin/hyperkube \
       kubelet \
@@ -31,6 +32,7 @@ contents: |
 {{- else}}
         --node-ip=${KUBELET_NODE_IP} \
 {{- end}}
+        ${HOSTNAME_FLAG} \
         --minimum-container-ttl-duration=6m0s \
         --volume-plugin-dir=/etc/kubernetes/kubelet-plugins/volume/exec \
         --cloud-provider={{cloudProvider .}} \
