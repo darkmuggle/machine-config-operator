@@ -6,6 +6,7 @@ package daemon
 import (
 	"fmt"
 	"os"
+	"os/user"
 	"path/filepath"
 
 	"github.com/pkg/errors"
@@ -49,4 +50,20 @@ func getRootBlockDeviceSysfs() (string, error) {
 		return getParentDeviceSysfs(root)
 	}
 	return "", fmt.Errorf("Failed to find %s", root)
+}
+
+// getCoreUserSSHPath looks up the user path and returns the correct
+// path for SSH passwords.
+func getCoreUserSSHPath(os OperatingSystem) (string, error) {
+	user, err := user.Lookup(coreUserName)
+	if err != nil {
+		return "", err
+	}
+
+	baseSSH := filepath.Join(user.HomeDir, ".ssh")
+	if os.IsFCOS() {
+		return filepath.Join(baseSSH, "authorized_keys.d", "ignition"), nil
+	}
+
+	return filepath.Join(baseSSH, ".ssh", "authorized_keys"), nil
 }

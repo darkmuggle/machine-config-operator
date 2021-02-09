@@ -42,8 +42,6 @@ const (
 	defaultFilePermissions os.FileMode = 0644
 	// coreUser is "core" and currently the only permissible user name
 	coreUserName = "core"
-	// SSH Keys for user "core" will only be written at /home/core/.ssh
-	coreUserSSHPath = "/home/core/.ssh/"
 	// fipsFile is the file to check if FIPS is enabled
 	fipsFile              = "/proc/sys/crypto/fips_enabled"
 	extensionsRepo        = "/etc/yum.repos.d/coreos-extensions.repo"
@@ -1725,7 +1723,18 @@ func getFileOwnership(file ign3types.File) (int, int, error) {
 }
 
 func (dn *Daemon) atomicallyWriteSSHKey(keys string) error {
-	authKeyPath := filepath.Join(coreUserSSHPath, "authorized_keys")
+	authKeyPath, err := getCoreUserSSHPath(dn.os)
+	if err != nil {
+		return err
+	}
+
+	// baseSshDir ensure that the SSH authorized keyes files
+	baseSSHDir := filepath.Dir(authKeyPath)
+	if _, err := os.Stat(baseSSHDir); err != nil && os.IsNotExist(err) {
+		if err := os.MkdirAll(baseSSHDir, 755); err != nil {
+			return err
+		}
+	}
 
 	// Keys should only be written to "/home/core/.ssh"
 	// Once Users are supported fully this should be writing to PasswdUser.HomeDir
@@ -1736,6 +1745,23 @@ func (dn *Daemon) atomicallyWriteSSHKey(keys string) error {
 	}
 
 	glog.V(2).Infof("Wrote SSHKeys at %s", authKeyPath)
+
+	// SSH keys _must_ be owned the user.
+	u, _ := user.Lookup(coreUserName)
+	uid, err := strconv.Atoi(u.Uid)
+	if err != nil {
+		return err
+	}
+	gid, err := strconv.Atoi(u.Gid)
+	if err != nil {
+		return err
+	}
+	for _, d := range []string{baseSSHDir, authKeyPath} {
+		if err := os.Chown(d, uid, gid); err != nil {
+			glog.Warningf("failed to set permissions on SSH key path %s: %v", d, err)
+			return err
+		}
+	}
 
 	return nil
 }
